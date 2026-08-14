@@ -1,0 +1,144 @@
+# Video
+import cv2, numpy as np, math, os, subprocess, shutil, tempfile
+
+SRC = [
+    "/mnt/data/43C6C176-A8E9-46AE-9F28-DCB296A1C8B5.jpeg",
+    "/mnt/data/C840F7E4-8188-4787-A501-40BE89C8C0EC.jpeg",
+    "/mnt/data/3770D15A-BCEF-455D-AD5C-C6028ECF0AA6.jpeg",
+    "/mnt/data/EBEC82E6-E2B7-44FF-9AD7-581F6E25F2D6.jpeg",
+]
+POLYS = [
+    [(460,40),(950,40),(950,580),(1100,580),(1100,960),(1260,960),(1260,1190),(150,1190),(150,960),(300,960),(300,580),(460,580)],
+    [(410,30),(1020,30),(1020,550),(1160,550),(1160,980),(1220,980),(1220,1170),(150,1170),(150,980),(250,980),(250,550),(410,550)],
+    [(335,15),(1075,15),(1075,555),(1110,555),(1110,970),(1250,970),(1250,1185),(145,1185),(145,970),(300,970),(300,555),(335,555)],
+    [(370,20),(1030,20),(1030,550),(1100,550),(1100,960),(1180,960),(1180,1170),(170,1170),(170,960),(320,960),(320,550),(370,550)]
+]
+
+# Final composition at 640x360, then high-quality upscale to 1280x720.
+W, H = 640, 360
+face_w, face_h = 300, 420
+
+# One fixed, consistent background: blurred plaza/building from the first photo,
+# with the monument removed so none of the four original backgrounds rotate.
+base = cv2.imread(SRC[0])
+m = np.zeros(base.shape[:2], np.uint8)
+cv2.fillPoly(m, [np.array(POLYS[0], np.int32)], 255)
+bg = cv2.inpaint(base, m, 31, cv2.INPAINT_TELEA)
+bg = cv2.GaussianBlur(bg, (0,0), 22)
+bg = cv2.resize(bg, (W,H), interpolation=cv2.INTER_AREA)
+
+# Make four clean face textures from the actual monument portions.
+textures = []
+for f, poly in zip(SRC, POLYS):
+    im = cv2.imread(f)
+    xs, ys = zip(*poly)
+    x0, x1 = max(0,min(xs)), min(im.shape[1]-1,max(xs))
+    y0, y1 = max(0,min(ys)), min(im.shape[0]-1,max(ys))
+    crop = im[y0:y1+1, x0:x1+1].copy()
+    p = np.array([(x-x0,y-y0) for x,y in poly], np.int32)
+    mask = np.zeros(crop.shape[:2], np.uint8)
+    cv2.fillPoly(mask, [p], 255)
+    # Fill only the small exterior margins with nearby monument texture,
+    # so the face itself never reveals a different city background.
+    filled = cv2.inpaint(crop, 255-mask, 7, cv2.INPAINT_TELEA)
+    crop[mask < 200] = filled[mask < 200]
+    textures.append(cv2.resize(crop,(face_w,face_h),interpolation=cv2.INTER_AREA))
+
+# Cuboid dimensions. Each of the four user photos is one exact side.
+hw, hd, hh = 0.46, 0.30, 0.72
+focal, cx, cy = 570.0, W/2, H*0.57
+
+faces = [
+    (0, np.array([[-hw,-hd,-hh],[hw,-hd,-hh],[hw,-hd,hh],[-hw,-hd,hh]],float)),
+    (1, np.array([[hw,-hd,-hh],[hw,hd,-hh],[hw,hd,hh],[hw,-hd,hh]],float)),
+    (2, np.array([[hw,hd,-hh],[-hw,hd,-hh],[-hw,hd,hh],[hw,hd,hh]],float)),
+    (3, np.array([[-hw,hd,-hh],[-hw,-hd,-hh],[-hw,-hd,hh],[-hw,hd,hh]],float)),
+]
+
+def rot_y(P, a):
+    c,s = math.cos(a), math.sin(a)
+    return np.column_stack((c*P[:,0]+s*P[:,2], P[:,1],
+                            -s*P[:,0]+c*P[:,2]))
+
+def project(P):
+    z = P[:,2] + 3.0
+    return np.column_stack((cx + focal*P[:,0]/z, cy - focal*P[:,1]/z))
+
+def render(angle):
+    frame = bg.copy()
+
+    # Consistent ground shadow.
+    sh = np.zeros((H,W),np.uint8)
+    cv2.ellipse(sh,(W//2,int(H*.88)),(145,22),0,0,360,105,-1)
+    sh = cv2.GaussianBlur(sh,(0,0),10)
+    a = (sh.astype(np.float32)/255*0.35)[:,:,None]
+    frame = (frame*(1-a)).astype(np.uint8)
+
+    rendered=[]
+    for idx,P0 in faces:
+        P=rot_y(P0,angle)
+        e1=P[1]-P[0]; e2=P[3]-P[0]
+        n=np.cross(e1,e2)
+        # camera-facing test
+        visible = n[2] < 0
+        rendered.append((P[:,2].mean(), visible, idx, P, n[2]))
+
+    for _,visible,idx,P,nz in sorted(rendered,key=lambda x:x[0], reverse=True):
+        if not visible: 
+            continue
+        dst=project(P).astype(np.float32)
+        src=np.float32([[0,0],[face_w-1,0],[face_w-1,face_h-1],[0,face_h-1]])
+        M=cv2.getPerspectiveTransform(src,dst)
+        warped=cv2.warpPerspective(textures[idx],M,(W,H),flags=cv2.INTER_LINEAR)
+        pm=np.zeros((H,W),np.uint8)
+        cv2.fillConvexPoly(pm,np.int32(dst),255)
+
+        # Orientation shading, but never alters the sculpture details.
+        sf = 0.72 + 0.28*min(1.0,max(0.0,abs(nz)))
+        warped=(warped.astype(np.float32)*sf).clip(0,255).astype(np.uint8)
+        aa=(pm.astype(np.float32)/255)[:,:,None]
+        frame=(frame*(1-aa)+warped*aa).astype(np.uint8)
+
+    return frame
+
+# Motion schedule: 4 clear cardinal views, with smooth 90° transitions.
+# One full 360° turn, and every side gets a deliberate viewing hold.
+fps=15
+hold=1.0
+turn=3.0
+segment=hold+turn
+total=4*segment
+raw="/mnt/data/_monument_orbit_15fps.mp4"
+writer=cv2.VideoWriter(raw,cv2.VideoWriter_fourcc(*"mp4v"),fps,(W,H))
+
+for k in range(int(total*fps)):
+    t=k/fps
+    seg=min(3,int(t/segment))
+    local=t-seg*segment
+    a0=seg*(math.pi/2)
+    if local < hold:
+        angle=a0
+    else:
+        q=min(1.0,(local-hold)/turn)
+        q=q*q*(3-2*q)
+        angle=a0 + q*(math.pi/2)
+    writer.write(render(angle))
+
+writer.release()
+
+out="/mnt/data/AI_3D_360度四面環景_完整修正版.mp4"
+cmd=[
+    "ffmpeg","-y","-i",raw,
+    "-vf","scale=1280:720:flags=lanczos",
+    "-c:v","libx264","-preset","ultrafast","-crf","22",
+    "-pix_fmt","yuv420p","-r","30","-movflags","+faststart",out
+]
+r=subprocess.run(cmd,capture_output=True,text=True,timeout=45)
+if r.returncode!=0:
+    raise RuntimeError(r.stderr[-1800:])
+os.remove(raw)
+
+print(f"完成：{out}")
+print("內容：四張原始雕像照片分別固定於 3D 四側面，完整 360° 環繞一圈；每一面都有停留讓雕像完整可見。")
+print("背景：四面統一為同一個固定、柔焦的廣場環境，不再隨照片切換。")
+print("規格：1280×720、30 fps、約 16 秒。")
